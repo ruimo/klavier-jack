@@ -2,6 +2,11 @@
 name = "klavier-jack"
 version = "0.1.0"
 edition = "2021"
+description = "Jack library of klavier."
+license = "Apache-2.0"
+documentation = "https://github.com/ruimo/klavier-jack"
+homepage = "https://github.com/ruimo/klavier-jack"
+repository = "https://github.com/ruimo/klavier-jack"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
