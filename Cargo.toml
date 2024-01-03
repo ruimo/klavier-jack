@@ -1,0 +1,19 @@
+[package]
+name = "klavier-jack"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+#klavier-helper = { path = "../klavier-helper" }
+klavier-helper = "0.1.3-beta.5"
+#klavier-core = { path = "../klavier-core" }
+klavier-core = "0.1.1-beta.9"
+jack = "^0"
+error-stack = "0.4.1"
+
+[workspace]
+members = [
+    "examples/*",
+]
