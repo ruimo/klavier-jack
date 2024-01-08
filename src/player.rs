@@ -1,20 +1,23 @@
-use std::{sync::mpsc::{sync_channel, SyncSender, SendError, Receiver, RecvError}, rc::Rc, collections::{HashMap, BTreeMap}, fmt::Display};
+use std::{sync::mpsc::{sync_channel, SyncSender, Receiver, RecvError}, rc::Rc, collections::{HashMap, BTreeMap}, fmt::Display, cell::Cell, marker::PhantomData, thread, time};
 
-use jack::{AsyncClient, ClosureProcessHandler};
+use jack::{Client, ClientStatus, MidiOut, ProcessScope, RawMidi, Control, MidiWriter};
 use klavier_core::{note::Note, project::{ModelChangeMetadata, tempo_at}, bar::Bar, tempo::{Tempo, TempoValue}, ctrl_chg::CtrlChg, key::Key, rhythm::Rhythm, repeat::{render_region, RenderRegionError, Chunk}, sharp_flat::SharpFlat, solfa::Solfa, octave::Octave, pitch::Pitch, repeat_set, velocity::Velocity, duration::Duration, global_repeat::RenderRegionWarning};
 use klavier_core::bar::RepeatSet;
 use klavier_helper::{bag_store::BagStore, store::Store, sliding};
-use error_stack::{Result, Report, Context};
+use error_stack::{Result, Context};
 use klavier_core::channel::Channel;
 
+#[cfg(not(test))]
+use jack::{AsyncClient, ClosureProcessHandler};
+
 // Accumulated tick after rendering repeats.
-type AccumTick = u32;
+pub type AccumTick = u32;
 
 pub struct Player {
   pub sampling_rate: usize,
   cmd_channel: SyncSender<Cmd>,
-  resp_channel: Receiver<Resp>,
-  closer: Box<dyn FnOnce() -> Option<jack::Error>>,
+  resp_channel: Option<Receiver<Resp>>,
+  closer: Option<Box<dyn FnOnce() -> Option<jack::Error>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -57,6 +60,7 @@ impl MidiSrc {
   }
 }
 
+#[derive(Clone)]
 pub struct PlayData {
   midi_data: Store<u64, Vec<u8>, ()>,
   // Key: cycle, Value: tick
@@ -249,6 +253,7 @@ impl MidiEvents {
   }
 }
 
+#[derive(Clone)]
 pub enum Cmd {
   Play {
     seq: usize,
@@ -268,7 +273,9 @@ pub enum CmdError {
 #[derive(Debug, PartialEq, Eq, Clone)]
 pub enum CmdInfo {
   PlayingEnded,
-  CurrentLoc(u32, AccumTick),
+  CurrentLoc{
+    seq: usize, tick: u32, accum_tick: AccumTick
+  },
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -295,94 +302,232 @@ pub enum PlayState {
   }
 }
 
+#[cfg(not(test))]
+pub struct JackClientProxy {
+  client: Option<Client>,
+  status: ClientStatus,
+}
+
+pub struct TestMidiWriter<'a> {
+  _phantom: PhantomData<&'a ()>,
+}
+
+impl<'a> TestMidiWriter<'a> {
+  pub fn write(&mut self, _message: &RawMidi) -> Result<(), jack::Error> {
+    Ok(())
+  }
+}
+
+#[cfg(not(test))]
+impl JackClientProxy {
+  pub fn new(app_name: &str, options: jack::ClientOptions) -> Result<Self, jack::Error> {
+    let (client, status) = jack::Client::new(app_name, options)?;
+    Ok(Self { client: Some(client), status })
+  }
+
+  pub fn buffer_size(&self) -> u32 {
+    self.client.as_ref().map(|c| c.buffer_size()).unwrap()
+  }
+
+  pub fn sampling_rate(&self) -> usize {
+    self.client.as_ref().map(|c| c.sample_rate()).unwrap()
+  }
+
+  pub fn midi_out_port(&self) -> Result<Port<MidiOut>, jack::Error> {
+    Ok(self.client.as_ref().map(|c| c.register_port("MIDI OUT", jack::MidiOut::default())).unwrap()?)
+  }
+
+  pub fn closer<F>(&mut self, callback: F) -> Result<Option<Box<dyn FnOnce() -> Option<jack::Error>>>, jack::Error> where F: 'static + Send + FnMut(&Client, &ProcessScope) -> Control {
+    let active_client: AsyncClient<(), ClosureProcessHandler<_>> = {
+      let client = self.client.take().unwrap();
+      client.activate_async((), jack::ClosureProcessHandler::new(callback))?
+    };
+    let closer = move || active_client.deactivate().err();
+    Ok(Some(Box::new(closer)))
+  }
+}
+
+pub struct TestPort<T> {
+  _phantom: PhantomData<T>,
+}
+
+impl<T> TestPort<T> {
+  pub fn writer<'a>(&'a mut self, _ps: &'a ProcessScope) -> TestMidiWriter<'a> {
+    TestMidiWriter {
+      _phantom: PhantomData
+    }
+  }
+}
+
+pub struct TestJackClientProxy {
+  pub status: ClientStatus,
+
+  pub app_name: String,
+  pub buffer_size: u32,
+  pub sampling_rate: usize,
+}
+
+#[cfg(not(test))]
+use jack::Port;
+
+impl TestJackClientProxy {
+  pub fn new(_app_name: &str, _options: jack::ClientOptions) -> Result<Self, jack::Error> {
+    panic!("You need to pass client_factory to Player::open() for testing.");
+  }
+
+  pub fn new_test(
+    app_name: &str, _options: jack::ClientOptions, status: ClientStatus, buffer_size: u32, sampling_rate: usize
+  ) -> Result<Self, jack::Error> {
+    Ok(Self { status, app_name: app_name.to_owned(), buffer_size, sampling_rate } )
+  }
+
+  pub fn buffer_size(&self) -> u32 {
+    self.buffer_size
+  }
+
+  pub fn sampling_rate(&self) -> usize {
+    self.sampling_rate
+  }
+
+  pub fn midi_out_port(&self) -> Result<TestPort<MidiOut>, jack::Error> {
+    Ok(
+      TestPort {
+        _phantom: PhantomData
+      }
+    )
+  }
+
+  pub fn closer<F>(&mut self, _callback: F) -> Result<Option<Box<dyn FnOnce() -> Option<jack::Error>>>, jack::Error> where F: 'static + Send + FnMut(&Client, &ProcessScope) -> Control {
+    thread::spawn(move || {
+      let _cb = _callback;
+      // Keep callback instance until test is finished.
+      thread::sleep(time::Duration::from_secs(60));
+    });
+
+    Ok(None)
+  }
+}
+
+#[cfg(test)]
+use TestJackClientProxy as JCProxy;
+
+#[cfg(not(test))]
+use JackClientProxy as JCProxy;
+
+#[cfg(test)]
+use TestMidiWriter as MW;
+
+#[cfg(not(test))]
+use MidiWriter as MW;
+
 impl Player {
-  pub fn open(app_name: &str) -> Result<(Self, jack::ClientStatus), jack::Error> {
-    let (client, status) = jack::Client::new(app_name, jack::ClientOptions::empty())?;
-    let mut out_port = client.register_port("MIDI OUT", jack::MidiOut::default())?;
+  fn resp(resp_sender: &SyncSender<Resp>, resp: Resp) {
+    if let Err(e) = resp_sender.send(resp) {
+      println!("Cannot send response: {:?}.", e);
+    }
+  }
+
+  fn perform_cmd(cmd_receiver: &Receiver<Cmd>, pstate: &mut PlayState, resp_sender: &SyncSender<Resp>) -> jack::Control {
+    match cmd_receiver.try_recv() {
+      Ok(cmd) => {
+        match cmd {
+          Cmd::Play { seq, play_data } => {
+            match pstate {
+              PlayState::Init => {
+                *pstate = PlayState::Playing { seq, current_loc: 0, play_data };
+                Self::resp(&resp_sender, Resp::Ok { seq });
+              }
+              PlayState::Playing { seq: _seq, current_loc: _, play_data: _ } => {
+                Self::resp(&resp_sender, Resp::Err { seq: Some(seq), error: CmdError::AlreadyPlaying });
+              }
+            }
+          }
+          Cmd::Stop { seq } => {
+            match pstate {
+              PlayState::Init => {
+                Self::resp(&resp_sender, Resp::Ok { seq });
+              },
+              PlayState::Playing { seq: _seq, current_loc: _, play_data: _ } => {
+                *pstate = PlayState::Init;
+                Self::resp(&resp_sender, Resp::Ok { seq });
+              }
+            }
+          }
+        }
+      }
+      Err(err) =>
+        if err == std::sync::mpsc::TryRecvError::Disconnected {
+          return jack::Control::Quit;
+        }
+    }
+
+    jack::Control::Continue
+  }
+
+  fn perform_state<'a>(pstate: &mut PlayState, midi_writer: &mut MW<'a>, resp_sender: &SyncSender<Resp>, buffer_size: u32, sampling_rate: usize) {
+    match pstate {
+      PlayState::Init => {},
+      PlayState::Playing { seq: playing_seq, current_loc, play_data } => {
+        let (_idx, data) = play_data.midi_data.range(*current_loc..(*current_loc + buffer_size as u64));
+        for (cycle, midi) in data.iter() {
+          let offset = (cycle - *current_loc) as u32;
+
+          if let Err(e) = midi_writer.write(&jack::RawMidi { time: offset, bytes: midi }) {
+            Self::resp(&resp_sender, Resp::Err { seq: None, error: CmdError::MidiWriteError(e.to_string()) })
+          }
+        }
+
+        let new_loc = *current_loc + buffer_size as u64;
+        let ended = play_data.midi_data.peek_last().map(|(cycle, _midi) | *cycle < new_loc).unwrap_or(false);
+        if ended {
+          Self::resp(&resp_sender, Resp::Info { seq: Some(*playing_seq), info: CmdInfo::PlayingEnded });
+          *pstate = PlayState::Init;
+        } else {
+          let accum_tick = play_data.cycle_to_tick(*current_loc, sampling_rate as u32);
+          let tick = play_data.accum_tick_to_tick(accum_tick);
+          Self::resp(&resp_sender, Resp::Info { seq: Some(*playing_seq), info: CmdInfo::CurrentLoc { seq: *playing_seq, tick, accum_tick } });
+          *current_loc = new_loc;
+        }
+      }
+    }
+  }
+
+  pub fn open(
+    app_name: &str, client_factory: Option<Box<dyn FnOnce(&str, jack::ClientOptions) -> Result<JCProxy, jack::Error>>>
+  ) -> Result<(Self, jack::ClientStatus), jack::Error> {
+    let mut proxy = match client_factory {
+      Some(factory) => {
+        factory(app_name, jack::ClientOptions::empty())?
+      }
+      None => {
+        JCProxy::new(app_name, jack::ClientOptions::empty())?
+      }
+    };
     let (cmd_sender, cmd_receiver) = sync_channel::<Cmd>(64);
     let (resp_sender, resp_receiver) = sync_channel::<Resp>(64);
 
-    let buffer_size: u32 = client.buffer_size();
-    let sampling_rate = client.sample_rate();
+    let buffer_size: u32 = proxy.buffer_size();
+    let sampling_rate = proxy.sampling_rate();
     let mut state = PlayState::Init;
+    let proxy_status = proxy.status;
 
+    let mut midi_out_port = proxy.midi_out_port()?;
     let callback = move |_client: &jack::Client, ps: &jack::ProcessScope| -> jack::Control {
       let mut pstate = &mut state;
+      let mut midi_writer = midi_out_port.writer(ps);
 
-      fn resp(resp_sender: &SyncSender<Resp>, resp: Resp) {
-        if let Err(e) = resp_sender.send(resp) {
-          println!("Cannot send response: {:?}.", e);
-        }
+      if Self::perform_cmd(&cmd_receiver, &mut pstate, &resp_sender) == jack::Control::Quit {
+        return jack::Control::Quit;
       }
 
-      let mut midi_writer = out_port.writer(ps);
-
-      match cmd_receiver.try_recv() {
-        Ok(cmd) => {
-          match cmd {
-            Cmd::Play { seq, play_data } => {
-              match pstate {
-                PlayState::Init => {
-                  *pstate = PlayState::Playing { seq, current_loc: 0, play_data };
-                  resp(&resp_sender, Resp::Ok { seq });
-                }
-                PlayState::Playing { seq: _seq, current_loc: _, play_data: _ } => {
-                  resp(&resp_sender, Resp::Err { seq: Some(seq), error: CmdError::AlreadyPlaying });
-                }
-              }
-            }
-            Cmd::Stop { seq } => {
-              match pstate {
-                PlayState::Init => {
-                  resp(&resp_sender, Resp::Ok { seq });
-                },
-                PlayState::Playing { seq: _seq, current_loc: _, play_data: _ } => {
-                  *pstate = PlayState::Init;
-                  resp(&resp_sender, Resp::Ok { seq });
-                }
-              }
-            }
-          }
-        }
-        Err(err) =>
-          if err == std::sync::mpsc::TryRecvError::Disconnected {
-            return jack::Control::Quit;
-          }
-      };
-
-      match &mut pstate {
-        PlayState::Init => {},
-        PlayState::Playing { seq: playing_seq, current_loc, play_data } => {
-          let (_idx, data) = play_data.midi_data.range(*current_loc..(*current_loc + buffer_size as u64));
-          for (cycle, midi) in data.iter() {
-            let offset = (cycle - *current_loc) as u32;
-
-            if let Err(e) = midi_writer.write(&jack::RawMidi { time: offset, bytes: midi }) {
-              resp(&resp_sender, Resp::Err { seq: None, error: CmdError::MidiWriteError(e.to_string()) })
-            }
-          }
-
-          let new_loc = *current_loc + buffer_size as u64;
-          let ended = play_data.midi_data.peek_last().map(|(cycle, _midi) | *cycle < new_loc).unwrap_or(false);
-          if ended {
-            resp(&resp_sender, Resp::Info { seq: Some(*playing_seq), info: CmdInfo::PlayingEnded });
-            *pstate = PlayState::Init;
-          } else {
-            let accum_tick = play_data.cycle_to_tick(*current_loc, sampling_rate as u32);
-            let tick = play_data.accum_tick_to_tick(accum_tick);
-            resp(&resp_sender, Resp::Info { seq: Some(*playing_seq), info: CmdInfo::CurrentLoc(tick, accum_tick) });
-            *current_loc = new_loc;
-          }
-        }
-      };
+      Self:: perform_state(&mut pstate, &mut midi_writer, &resp_sender, buffer_size, sampling_rate);
 
       jack::Control::Continue
     };
 
-    let active_client: AsyncClient<(), ClosureProcessHandler<_>> = client.activate_async((), jack::ClosureProcessHandler::new(callback))?;
-    let closer = move || active_client.deactivate().err();
+    let closer = proxy.closer(callback)?;
 
-    Ok((Player { sampling_rate, cmd_channel: cmd_sender, resp_channel: resp_receiver, closer: Box::new(closer) }, status))    
+    Ok((Player { sampling_rate, cmd_channel: cmd_sender, resp_channel: Some(resp_receiver), closer }, proxy_status))    
   }
 
   fn create_key_table(top_key: Key, bar_repo: &Store<u32, Bar, ModelChangeMetadata>) -> Store<u32, Key, ()> {
@@ -501,7 +646,7 @@ impl Player {
 
   pub fn play(
     &mut self,
-    top_rhythm: Rhythm, top_key: Key,
+    seq: usize, top_rhythm: Rhythm, top_key: Key,
     note_repo: &BagStore<u32, Rc<Note>, ModelChangeMetadata>,
     bar_repo: &Store<u32, Bar, ModelChangeMetadata>,
     tempo_repo: &Store<u32, Tempo, ModelChangeMetadata>,
@@ -510,22 +655,44 @@ impl Player {
   ) -> Result <Vec<RenderRegionWarning>, PlayError> {
     let (events, warnings) = Self::create_midi_events(
       top_rhythm, top_key, note_repo, bar_repo, tempo_repo, dumper_repo, soft_repo
-    ).map_err(|e| PlayError::RenderError(e))?;
+    ).map_err(|e| PlayError::RenderError(e.current_context().clone()))?;
     let play_data = events.to_play_data(self.sampling_rate, Duration::TICK_RESOLUTION as u32);
-    let seq: usize = 1;
-    self.cmd_channel.send(Cmd::Play { seq, play_data }).map_err(|e| PlayError::SendError(e))?;
+    self.cmd_channel.send(Cmd::Play { seq, play_data }).map_err(|_e| PlayError::SendError { seq })?;
     Ok(warnings)
   }
 
+  pub fn stop(&mut self, seq: usize) -> Result <(), PlayError> {
+    self.cmd_channel.send(Cmd::Stop { seq }).map_err(|_e| PlayError::SendError { seq })?;
+    Ok(())
+  }
+
+  /// Get response from the response receiver.
   pub fn get_resp(&self) -> Result<Resp, RecvError> {
-    Ok(self.resp_channel.recv()?)
+    match &self.resp_channel {
+        Some(resp) => Ok(resp.recv()?),
+        None => panic!("Once you call the take_resp(), you need to receive responses by yourself!"),
+    }
+  }
+
+  /// Take the response receiver. Once you take the receiver, you cannot call get_resp() any more. You need to receive responses by yourself through the taken receiver.
+  /// If you have already taken the receiver before, None will return.
+  pub fn take_resp(&mut self) -> Option<Receiver<Resp>> {
+    self.resp_channel.take()
   }
 }
 
-#[derive(Debug)]
+impl Drop for Player {
+    fn drop(&mut self) {
+        if let Some(f) = self.closer.take() {
+          f();
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum PlayError {
-  RenderError(Report<RenderRegionError>),
-  SendError(SendError<Cmd>),
+  RenderError(RenderRegionError),
+  SendError { seq: usize },
 }
 
 impl Display for PlayError {
@@ -536,14 +703,84 @@ impl Display for PlayError {
 
 impl Context for PlayError {}
 
+// pub struct TestPlayer {
+//   pub sampling_rate: usize,
+//   pub cmd_channel: SyncSender<Cmd>,
+//   pub resp_channel: Option<Receiver<Resp>>,
+
+//   pub cmd_receiver: Receiver<Cmd>,
+//   pub resp_sender: SyncSender<Resp>,
+//   pub name: String,
+// }
+
+// impl TestPlayer {
+//   pub const SAMPLING_RATE: Cell<usize> = Cell::new(48000);
+//   pub const CLIENT_STATUS: Cell<jack::ClientStatus> = Cell::new(jack::ClientStatus::empty());
+
+//   pub fn open(
+//     app_name: &str,
+//     _client_factory: Option<Box<impl FnOnce(&str, jack::ClientOptions) -> Result<(Client, ClientStatus), jack::Error>>>
+//   ) -> Result<(Self, jack::ClientStatus), jack::Error> {
+//     let (cmd_sender, cmd_receiver) = sync_channel::<Cmd>(256);
+//     let (resp_sender, resp_receiver) = sync_channel::<Resp>(256);
+
+//     Ok((
+//       Self {
+//         sampling_rate: Self::SAMPLING_RATE.get(),
+//         cmd_channel: cmd_sender,
+//         resp_channel: Some(resp_receiver),
+//         cmd_receiver,
+//         resp_sender,
+//         name: app_name.to_owned(),
+//       },
+//       Self::CLIENT_STATUS.get()
+//     ))
+//   }
+
+//   pub fn play(
+//     &mut self,
+//     seq: usize, top_rhythm: Rhythm, top_key: Key,
+//     note_repo: &BagStore<u32, Rc<Note>, ModelChangeMetadata>,
+//     bar_repo: &Store<u32, Bar, ModelChangeMetadata>,
+//     tempo_repo: &Store<u32, Tempo, ModelChangeMetadata>,
+//     dumper_repo: &Store<u32, CtrlChg, ModelChangeMetadata>,
+//     soft_repo: &Store<u32, CtrlChg, ModelChangeMetadata>,
+//   ) -> Result <Vec<RenderRegionWarning>, PlayError> {
+//     let (events, warnings) = Player::create_midi_events(
+//       top_rhythm, top_key, note_repo, bar_repo, tempo_repo, dumper_repo, soft_repo
+//     ).map_err(|e| PlayError::RenderError(e.current_context().clone()))?;
+//     let play_data = events.to_play_data(self.sampling_rate, Duration::TICK_RESOLUTION as u32);
+//     self.cmd_channel.send(Cmd::Play { seq, play_data }).map_err(|_e| PlayError::SendError { seq })?;
+//     Ok(warnings)
+//   }
+
+//   pub fn stop(&mut self, seq: usize) -> Result <(), PlayError> {
+//     self.cmd_channel.send(Cmd::Stop { seq }).map_err(|_e| PlayError::SendError { seq })?;
+//     Ok(())
+//   }
+
+//   pub fn get_resp(&self) -> Result<Resp, RecvError> {
+//     match &self.resp_channel {
+//         Some(resp) => Ok(resp.recv()?),
+//         None => panic!("Once you call the take_resp(), you need to receive responses by yourself!"),
+//     }
+//   }
+
+//   pub fn take_resp(&mut self) -> Option<Receiver<Resp>> {
+//     self.resp_channel.take()
+//   }
+// }
+
 #[cfg(test)]
 mod tests {
-  use std::rc::Rc;
-  use klavier_core::{rhythm::Rhythm, key::Key, note::Note, pitch::Pitch, solfa::Solfa, octave::Octave, sharp_flat::SharpFlat, trimmer::Trimmer, project::ModelChangeMetadata, bar::{Bar, Repeat}, repeat_set, tempo::{Tempo, TempoValue}, velocity::Velocity};
+  use std::{rc::Rc, sync::mpsc::sync_channel};
+  use jack::ClientStatus;
+use klavier_core::{rhythm::Rhythm, key::Key, note::Note, pitch::Pitch, solfa::Solfa, octave::Octave, sharp_flat::SharpFlat, trimmer::Trimmer, project::ModelChangeMetadata, bar::{Bar, Repeat}, repeat_set, tempo::{Tempo, TempoValue}, velocity::Velocity};
   use klavier_helper::{bag_store::BagStore, store::Store};
-  use crate::player::MidiSrc;
-  use super::Player;
+  use crate::player::{MidiSrc, CmdError};
+  use super::{Player, JCProxy, Cmd, Resp, PlayState};
   use klavier_core::bar::RepeatSet;
+  use crate::player::TestJackClientProxy;
 
   #[test]
   fn empty() {
@@ -1096,4 +1333,192 @@ mod tests {
     assert_eq!(play_data.cycle_to_tick(cycle, 48000), 1220);
     assert_eq!(play_data.accum_tick_to_tick(1220), 740);
   } 
+
+  #[test]
+  fn play_send_cmd() {
+    let mut note_repo = BagStore::new(false);
+    let note0 = Rc::new(
+      Note {
+        base_start_tick: 100,
+        pitch: Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Null),
+        ..Default::default()
+      }
+    );
+    note_repo.add(note0.start_tick(), note0.clone(), ModelChangeMetadata::new());
+
+    let (events, _warnings) = Player::create_midi_events(
+      Rhythm::new(2, 4),
+      Key::SHARP_1,
+      &note_repo,
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false)
+    ).unwrap();
+
+    let play_data0 = events.to_play_data(48000, 240);
+ 
+    let factory = Box::new(|app_name: &str, _options|
+      Ok(
+        TestJackClientProxy {
+          status: ClientStatus::empty(),
+          app_name: app_name.to_owned(),
+          buffer_size: 2048,
+          sampling_rate: 48000,
+        }
+      )
+    );
+    let (mut player, status) = Player::open("my player", Some(factory)).unwrap();
+    let (cmd_sender, cmd_receiver) = sync_channel::<Cmd>(64);
+
+    player.cmd_channel = cmd_sender;
+    
+    let _warnings = player.play(
+      1,
+      Rhythm::new(2, 4),
+      Key::SHARP_1,
+      &note_repo,
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false)
+    ).unwrap();
+
+    let cmd = cmd_receiver.recv().unwrap();
+
+    match cmd {
+        Cmd::Play { seq, play_data } => {
+          assert_eq!(seq, 1);
+
+          let midi_data0: Vec<&(u64, Vec<u8>)> = play_data0.midi_data.iter().collect();
+          let midi_data1: Vec<&(u64, Vec<u8>)> = play_data.midi_data.iter().collect();
+          assert_eq!(midi_data0, midi_data1);
+        }
+        Cmd::Stop { seq: _ } => panic!("test failed"),
+    };
+  }
+
+  #[test]
+  fn play_cmd_change_state() {
+    let mut note_repo = BagStore::new(false);
+    let note0 = Rc::new(
+      Note {
+        base_start_tick: 100,
+        pitch: Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Null),
+        ..Default::default()
+      }
+    );
+    note_repo.add(note0.start_tick(), note0.clone(), ModelChangeMetadata::new());
+
+    let (events, _warnings) = Player::create_midi_events(
+      Rhythm::new(2, 4),
+      Key::SHARP_1,
+      &note_repo,
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false)
+    ).unwrap();
+
+    let play_data0 = events.to_play_data(48000, 240);
+    let factory = Box::new(|app_name: &str, _options|
+      Ok(
+        TestJackClientProxy {
+          status: ClientStatus::empty(),
+          app_name: app_name.to_owned(),
+          buffer_size: 2048,
+          sampling_rate: 48000,
+        }
+      )
+    );
+    let (mut player, status) = Player::open("my player", Some(factory)).unwrap();
+    let (cmd_sender, cmd_receiver) = sync_channel::<Cmd>(64);
+    let (resp_sender, resp_receiver) = sync_channel::<Resp>(64);
+
+    player.cmd_channel = cmd_sender;
+    
+    let _warnings = player.play(
+      1,
+      Rhythm::new(2, 4),
+      Key::SHARP_1,
+      &note_repo,
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false)
+    ).unwrap();
+
+    let mut state = PlayState::Init;
+    let ctrl = Player::perform_cmd(&cmd_receiver, &mut state, &resp_sender);
+    assert_eq!(ctrl, jack::Control::Continue);
+
+    match &state {
+        PlayState::Init => panic!("Should playing."),
+        PlayState::Playing { seq, current_loc, play_data } => {
+          assert_eq!(*seq, 1);
+          assert_eq!(*current_loc, 0);
+          let midi_data0: Vec<&(u64, Vec<u8>)> = play_data0.midi_data.iter().collect();
+          let midi_data1: Vec<&(u64, Vec<u8>)> = play_data.midi_data.iter().collect();
+          assert_eq!(midi_data0, midi_data1);
+       }
+    }
+    let resp = resp_receiver.recv().unwrap();
+    assert_eq!(resp, Resp::Ok { seq: 1 });
+
+    // Play again while playing.    
+    let _warnings = player.play(
+      2,
+      Rhythm::new(2, 4),
+      Key::SHARP_1,
+      &note_repo,
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false)
+    ).unwrap();
+
+    let ctrl = Player::perform_cmd(&cmd_receiver, &mut state, &resp_sender);
+    assert_eq!(ctrl, jack::Control::Continue);
+
+    match &state {
+        PlayState::Init => panic!("Should playing."),
+        PlayState::Playing { seq, current_loc, play_data } => {
+          assert_eq!(*seq, 1);
+          assert_eq!(*current_loc, 0);
+          let midi_data0: Vec<&(u64, Vec<u8>)> = play_data0.midi_data.iter().collect();
+          let midi_data1: Vec<&(u64, Vec<u8>)> = play_data.midi_data.iter().collect();
+          assert_eq!(midi_data0, midi_data1);
+       }
+    }
+    let resp = resp_receiver.recv().unwrap();
+    assert_eq!(resp, Resp::Err { seq: Some(2), error: CmdError::AlreadyPlaying });
+
+    // Stop playing.
+    player.stop(3).unwrap();
+    let ctrl = Player::perform_cmd(&cmd_receiver, &mut state, &resp_sender);
+    assert_eq!(ctrl, jack::Control::Continue);
+
+    match &state {
+      PlayState::Init => {},
+      PlayState::Playing { seq: _, current_loc: _, play_data: _ } => panic!("Should init"),
+    }
+    let resp = resp_receiver.recv().unwrap();
+    assert_eq!(resp, Resp::Ok { seq: 3 });
+
+    // Stop again.
+    player.stop(4).unwrap();
+    let ctrl = Player::perform_cmd(&cmd_receiver, &mut state, &resp_sender);
+    assert_eq!(ctrl, jack::Control::Continue);
+
+    match &state {
+      PlayState::Init => {},
+      PlayState::Playing { seq: _, current_loc: _, play_data: _ } => panic!("Should init"),
+    }
+    let resp = resp_receiver.recv().unwrap();
+    assert_eq!(resp, Resp::Ok { seq: 4 });
+
+    drop(player);
+    let ctrl = Player::perform_cmd(&cmd_receiver, &mut state, &resp_sender);
+    assert_eq!(ctrl, jack::Control::Quit);
+  }
 }

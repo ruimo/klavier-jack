@@ -1,11 +1,10 @@
-use std::{thread, time::Duration, rc::Rc};
-
+use std::rc::Rc;
 use klavier_core::{note::Note, pitch::Pitch, solfa::Solfa, octave::Octave, sharp_flat::SharpFlat, project::ModelChangeMetadata, bar::{Bar, Repeat, RepeatSet}, key::Key, repeat_set, tempo::Tempo, rhythm::Rhythm};
 use klavier_helper::{bag_store::BagStore, store::Store};
 use klavier_jack::player::Player;
 
 fn main() {
-  let (mut player, status) = Player::open("klavier").unwrap();
+  let (mut player, status) = Player::open("klavier", None).unwrap();
   println!("Status: {:?}", status);
 
   let mut note_repo = BagStore::new(false);
@@ -50,7 +49,7 @@ fn main() {
   // tempo|120      |300
 
   player.play(
-    Rhythm::new(2, 4),
+    1, Rhythm::new(2, 4),
     Key::SHARP_1,
     &note_repo,
     &bar_repo,
