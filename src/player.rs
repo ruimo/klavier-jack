@@ -1,4 +1,4 @@
-use std::{sync::mpsc::{sync_channel, SyncSender, Receiver, RecvError}, rc::Rc, collections::{HashMap, BTreeMap}, fmt::Display, cell::Cell, marker::PhantomData, thread, time};
+use std::{sync::mpsc::{sync_channel, SyncSender, Receiver, RecvError}, rc::Rc, collections::{HashMap, BTreeMap}, fmt::Display, marker::PhantomData, thread, time};
 
 use jack::{Client, ClientStatus, MidiOut, ProcessScope, RawMidi, Control, MidiWriter};
 use klavier_core::{note::Note, project::{ModelChangeMetadata, tempo_at}, bar::Bar, tempo::{Tempo, TempoValue}, ctrl_chg::CtrlChg, key::Key, rhythm::Rhythm, repeat::{render_region, RenderRegionError, Chunk}, sharp_flat::SharpFlat, solfa::Solfa, octave::Octave, pitch::Pitch, repeat_set, velocity::Velocity, duration::Duration, global_repeat::RenderRegionWarning};
@@ -236,6 +236,7 @@ impl MidiEvents {
       for e in events.iter() {
         e.render_to(&mut midi);
       }
+
       midi_data.add(c, midi, ());
     }    
 
@@ -775,7 +776,7 @@ impl Context for PlayError {}
 mod tests {
   use std::{rc::Rc, sync::mpsc::sync_channel};
   use jack::ClientStatus;
-use klavier_core::{rhythm::Rhythm, key::Key, note::Note, pitch::Pitch, solfa::Solfa, octave::Octave, sharp_flat::SharpFlat, trimmer::Trimmer, project::ModelChangeMetadata, bar::{Bar, Repeat}, repeat_set, tempo::{Tempo, TempoValue}, velocity::Velocity};
+  use klavier_core::{rhythm::Rhythm, key::Key, note::Note, pitch::Pitch, solfa::Solfa, octave::Octave, sharp_flat::SharpFlat, trimmer::Trimmer, project::ModelChangeMetadata, bar::{Bar, Repeat}, repeat_set, tempo::{Tempo, TempoValue}, velocity::Velocity};
   use klavier_helper::{bag_store::BagStore, store::Store};
   use crate::player::{MidiSrc, CmdError};
   use super::{Player, JCProxy, Cmd, Resp, PlayState};

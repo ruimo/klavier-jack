@@ -5,33 +5,30 @@ use klavier_helper::{bag_store::BagStore, store::Store};
 use crate::player::{PlayError, AccumTick};
 use error_stack::{Result, Context};
 use tracing::error;
+use crate::player;
 
 #[cfg(not(test))]
-use crate::player::JackClientProxy;
+use player::JackClientProxy;
 
 #[cfg(test)]
-use crate::player::TestJackClientProxy as JackClientProxy;
+use player::TestJackClientProxy as JackClientProxy;
 
 //#[cfg(not(test))]
-use crate::player::Player;
-
-//#[cfg(test)]
-//use crate::player::TestPlayer as Player;
+use player::Player;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Status {
-  Disconnected,
-  Connected,
+  Stopped,
   StartingPlay { seq: usize },
   StoppingPlay { seq: usize },
   Playing { seq: usize, tick: u32, accum_tick: AccumTick },
+  Disconnected,
 }
 
 pub struct Tracker {
   seq: usize,
   player: Option<Player>,
   status: Arc<Mutex<Status>>,
-  client_factory: Option<Box<dyn FnOnce(&str, jack::ClientOptions) -> Result<JackClientProxy, jack::Error>>>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -39,6 +36,7 @@ pub enum TrackerError {
   PlayerNotOpened,
   PlayerStopping { seq: usize },
   PlayerErr(PlayError),
+  NotPlaying(Status),
 }
 
 impl Display for TrackerError {
@@ -50,61 +48,50 @@ impl Display for TrackerError {
 impl Context for TrackerError {}
 
 impl Tracker {
-  pub fn new(client_factory: Option<Box<dyn FnOnce(&str, jack::ClientOptions) -> Result<JackClientProxy, jack::Error>>>) -> Self {
-    Self {
-      seq: 0,
-      player: None,
-      status: Arc::new(Mutex::new(Status::Disconnected)),
-      client_factory,
-    }
-  }
-
-  pub fn run(&mut self, name: &str) -> Result<jack::ClientStatus, jack::Error> {
-    if *self.status.lock().unwrap() == Status::Disconnected {
-      let (mut player, status) = Player::open(name, self.client_factory.take())?;
-      *self.status.lock().unwrap() = Status::Connected;
+  pub fn run(
+    name: &str, mut client_factory: Option<Box<dyn FnOnce(&str, jack::ClientOptions) -> Result<JackClientProxy, jack::Error>>>
+  ) -> Result<(Self, jack::ClientStatus), jack::Error> {
+      let (mut player, client_status) = Player::open(name, client_factory.take())?;
       let receiver = player.take_resp().unwrap();
-      self.player = Some(player);
-
-      let cur_status = self.status.clone();
+      let status = Arc::new(Mutex::new(Status::Stopped));
+      let moved_status = status.clone();
       thread::spawn(move || {
         loop {
           match receiver.recv() {
             Ok(resp) => match resp {
-              crate::player::Resp::Err { seq, error } => {
+              player::Resp::Err { seq, error } => {
                 tracing::error!("Player command error seq: {:?}, error: {:?}", seq, error);
               }
-              crate::player::Resp::Info { seq, info } => match info {
-                crate::player::CmdInfo::PlayingEnded => {
-                  let mut p = cur_status.lock().unwrap();
-                  if let Status::StoppingPlay { seq } = *p {
-                    tracing::info!("Player stopped seq: {}", seq);
-                    *p = Status::Connected;
-                  }
+              player::Resp::Info { seq, info } => match info {
+                player::CmdInfo::PlayingEnded => {
+                  *moved_status.lock().unwrap() = Status::Stopped;
                 }
-                crate::player::CmdInfo::CurrentLoc{ seq, tick, accum_tick } => {
-                  *cur_status.lock().unwrap() = Status::Playing { seq, tick, accum_tick }
+                player::CmdInfo::CurrentLoc{ seq, tick, accum_tick } => {
+                  *moved_status.lock().unwrap() = Status::Playing { seq, tick, accum_tick }
                 }
               }
-              crate::player::Resp::Ok { seq } => {
+              player::Resp::Ok { seq } => {
                 tracing::info!("Player command ok seq: {}", seq);
               }
             }
             Err(err) => {
               println!("recv error: {:?}", err);
               error!("Player receiver disconnected {:?}", err);
-              *cur_status.lock().unwrap() = Status::Disconnected;
+              *moved_status.lock().unwrap() = Status::Disconnected;
               break;
             }
           }
         }
       });      
 
-      Ok(status)
-    } else {
-      // Already running. Do noting.
-      Ok(jack::ClientStatus::empty())
-    }
+      Ok((
+        Self {
+          seq: 0,
+          player: Some(player),
+          status,
+        },
+        client_status
+      ))
   }
 
   pub fn play(
@@ -141,11 +128,16 @@ impl Tracker {
   pub fn stop(&mut self, seq: usize) -> Result <(), TrackerError> {
     match &mut self.player {
       Some(jack)=> {
-        jack.stop(self.seq).map_err(|e| {
-          let top = TrackerError::PlayerErr(e.current_context().clone());
-          e.change_context(top)
-        })?;
-        *self.status.lock().unwrap() = Status::StoppingPlay { seq };
+        let mut pstatus = self.status.lock().unwrap();
+        if let Status::Playing { seq: _, tick: _, accum_tick: _ } = *pstatus {
+          jack.stop(self.seq).map_err(|e| {
+            let top = TrackerError::PlayerErr(e.current_context().clone());
+            e.change_context(top)
+          })?;
+          *pstatus = Status::StoppingPlay { seq };
+        } else {
+          Err(TrackerError::NotPlaying(*pstatus))?
+        }
 
         Ok(())
       }
@@ -180,35 +172,10 @@ mod tests {
       )
     );
 
-    let tracker = Tracker::new(Some(factory));
+    let (tracker, _status) = Tracker::run("app name", Some(factory)).unwrap();
     assert_eq!(tracker.seq, 0);
-    assert_eq!(tracker.player.is_none(), true);
-    assert_eq!(tracker.status(), Status::Disconnected);
-  }
-
-  #[test]
-  fn disconnected_play() {
-    let factory = Box::new(|app_name: &str, _options|
-      Ok(
-        TestJackClientProxy {
-          status: ClientStatus::empty(),
-          app_name: app_name.to_owned(),
-          buffer_size: 2048,
-          sampling_rate: 48000,
-        }
-      )
-    );
-    let mut tracker = Tracker::new(Some(factory));
-    let result = tracker.play(
-      1, Rhythm::new(2, 4),
-      Key::SHARP_1,
-      &BagStore::new(false),
-      &Store::new(false),
-      &Store::new(false),
-      &Store::new(false),
-      &Store::new(false),
-    ).err().unwrap();
-    assert_eq!(*result.current_context(), TrackerError::PlayerNotOpened);
+    assert_eq!(tracker.player.is_none(), false);
+    assert_eq!(tracker.status(), Status::Stopped);
   }
 
   #[test]
@@ -223,9 +190,10 @@ mod tests {
         }
       )
     );
-    let mut tracker = Tracker::new(Some(factory));
+    let (mut tracker, _status) = Tracker::run("app name", Some(factory)).unwrap();
+    assert_eq!(tracker.status(), Status::Stopped);
     let result = tracker.stop(1).err().unwrap();
-    assert_eq!(*result.current_context(), TrackerError::PlayerNotOpened);
+    assert_eq!(*result.current_context(), TrackerError::NotPlaying(Status::Stopped));
   }
 
   #[test]
@@ -240,9 +208,8 @@ mod tests {
         }
       )
     );
-    let mut tracker = Tracker::new(Some(factory));
-    let resp = tracker.run("my name").unwrap();
-    assert_eq!(resp, jack::ClientStatus::INIT_FAILURE);
+    let (mut tracker, status) = Tracker::run("my name", Some(factory)).unwrap();
+    assert_eq!(status, jack::ClientStatus::INIT_FAILURE);
 
     let result = tracker.play(
       1, Rhythm::new(2, 4),
@@ -255,6 +222,5 @@ mod tests {
     );
     assert_eq!(result.is_ok(), true);
     assert_eq!(tracker.status(), Status::StartingPlay { seq: 1 });
-
   }
 }
