@@ -1,4 +1,4 @@
-use std::{sync::mpsc::{sync_channel, SyncSender, Receiver, RecvError}, rc::Rc, collections::{HashMap, BTreeMap}, fmt::Display, marker::PhantomData, thread, time};
+use std::{sync::mpsc::{sync_channel, SyncSender, Receiver, RecvError}, rc::Rc, collections::{HashMap, BTreeMap}, fmt::Display, marker::PhantomData, thread::{self, current}, time};
 
 use jack::{Client, ClientStatus, MidiOut, ProcessScope, RawMidi, Control, MidiWriter};
 use klavier_core::{note::Note, project::{ModelChangeMetadata, tempo_at}, bar::Bar, tempo::{Tempo, TempoValue}, ctrl_chg::CtrlChg, key::Key, rhythm::Rhythm, repeat::{render_region, RenderRegionError, Chunk}, sharp_flat::SharpFlat, solfa::Solfa, octave::Octave, pitch::Pitch, repeat_set, velocity::Velocity, duration::Duration, global_repeat::RenderRegionWarning};
@@ -237,7 +237,17 @@ impl MidiEvents {
         e.render_to(&mut midi);
       }
 
-      midi_data.add(c, midi, ());
+      midi_data.replace(&c, (), |found: Option<&Vec<u8>>| {
+        match found {
+            Some(current_midi_data) => {
+              let mut buf = Vec::with_capacity(current_midi_data.len() + midi.len());
+              buf.extend(current_midi_data);
+              buf.extend(midi);
+              buf
+            },
+            None => midi,
+        }
+      });
     }    
 
     for (tick, tempo) in self.tempo_table.iter() {
@@ -873,6 +883,75 @@ mod tests {
       events.events.get(&(300 - 5 - 10 + note2.duration.tick_length())).unwrap(),
       &vec![MidiSrc::NoteOff { pitch: Pitch::new(Solfa::B, Octave::Oct4, SharpFlat::Sharp), channel: Default::default() }]
     );
+  }
+
+  #[test]
+  fn at_same_tick() {
+    let mut note_repo = BagStore::new(false);
+    let note0 = Rc::new(
+      Note {
+        base_start_tick: 100,
+        pitch: Pitch::new(Solfa::A, Octave::Oct4, SharpFlat::Null),
+        ..Default::default()
+      }
+    );
+    note_repo.add(note0.start_tick(), note0.clone(), ModelChangeMetadata::new());
+
+    let note1 = Rc::new(
+      Note {
+        base_start_tick: 100,
+        pitch: Pitch::new(Solfa::B, Octave::Oct4, SharpFlat::Sharp),
+        ..Default::default()
+      }
+    );
+    note_repo.add(note1.start_tick(), note1.clone(), ModelChangeMetadata::new());
+
+    let (events, _warnings) = Player::create_midi_events(
+      Rhythm::new(4, 4),
+      Key::FLAT_1,
+      &note_repo,
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false),
+      &Store::new(false)
+    ).unwrap();
+    assert_eq!(events.events.len(), 2);
+    assert_eq!(
+      events.events.get(&100).unwrap(),
+      &vec![
+        MidiSrc::NoteOn { pitch: note0.pitch, velocity: note0.velocity(), channel: Default::default() },
+        MidiSrc::NoteOn { pitch: note1.pitch, velocity: note1.velocity(), channel: Default::default() },
+      ]
+    );
+    assert_eq!(
+      events.events.get(&(100 + note0.duration.tick_length())).unwrap(),
+      &vec![
+        MidiSrc::NoteOff { pitch: note0.pitch, channel: Default::default() },
+        MidiSrc::NoteOff { pitch: note1.pitch, channel: Default::default() },
+      ]
+    );
+
+    let play_data = events.to_play_data(48000, 240);
+    let midi_data = &play_data.midi_data;
+    assert_eq!(midi_data.len(), 2);
+
+    let cycle = 100 * 48000 * 60 / 120 / 240;
+    assert_eq!(midi_data[0], (
+      cycle, vec![
+        0x90, Pitch::new(Solfa::A, Octave::Oct4, SharpFlat::Null).value(), Velocity::default().as_u8(),
+        0x90, Pitch::new(Solfa::B, Octave::Oct4, SharpFlat::Sharp).value(), Velocity::default().as_u8(),
+      ])
+    );
+    assert_eq!(play_data.cycle_to_tick(cycle, 48000), 100);
+
+    let cycle = ((100 + note0.duration.tick_length()) * 48000 * 60 / 120 / 240) as u64;
+    assert_eq!(midi_data[1], (
+      cycle, vec![
+        0x90, Pitch::new(Solfa::A, Octave::Oct4, SharpFlat::Null).value(), 0,
+        0x90, Pitch::new(Solfa::B, Octave::Oct4, SharpFlat::Sharp).value(), 0
+      ])
+    );
+    assert_eq!(play_data.cycle_to_tick(cycle, 48000), 340);
   }
 
   #[test]
