@@ -17,7 +17,7 @@ pub struct Player {
   pub sampling_rate: usize,
   cmd_channel: SyncSender<Cmd>,
   resp_channel: Option<Receiver<Resp>>,
-  closer: Option<Box<dyn FnOnce() -> Option<jack::Error>>>,
+  closer: Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -338,7 +338,9 @@ impl JackClientProxy {
     Ok(self.client.as_ref().map(|c| c.register_port("MIDI OUT", jack::MidiOut::default())).unwrap()?)
   }
 
-  pub fn closer<F>(&mut self, callback: F) -> Result<Option<Box<dyn FnOnce() -> Option<jack::Error>>>, jack::Error> where F: 'static + Send + FnMut(&Client, &ProcessScope) -> Control {
+  pub fn closer<F>(&mut self, callback: F) -> Result<Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>>, jack::Error>
+    where F: 'static + Send + FnMut(&Client, &ProcessScope) -> Control
+  {
     let active_client: AsyncClient<(), ClosureProcessHandler<_>> = {
       let client = self.client.take().unwrap();
       client.activate_async((), jack::ClosureProcessHandler::new(callback))?
@@ -398,7 +400,9 @@ impl TestJackClientProxy {
     )
   }
 
-  pub fn closer<F>(&mut self, _callback: F) -> Result<Option<Box<dyn FnOnce() -> Option<jack::Error>>>, jack::Error> where F: 'static + Send + FnMut(&Client, &ProcessScope) -> Control {
+  pub fn closer<F>(&mut self, _callback: F) -> Result<Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>>, jack::Error>
+    where F: 'static + Send + FnMut(&Client, &ProcessScope) -> Control
+  {
     thread::spawn(move || {
       let _cb = _callback;
       // Keep callback instance until test is finished.
@@ -526,7 +530,7 @@ impl Player {
       jack::Control::Continue
     };
 
-    let closer = proxy.closer(callback)?;
+    let closer: Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>> = proxy.closer(callback)?;
 
     Ok((Player { sampling_rate, cmd_channel: cmd_sender, resp_channel: Some(resp_receiver), closer }, proxy_status))    
   }
@@ -685,7 +689,11 @@ impl Player {
 impl Drop for Player {
     fn drop(&mut self) {
         if let Some(f) = self.closer.take() {
-          f();
+          let handle = thread::spawn(|| f());
+          for _ in 0..50 {
+            if handle.is_finished() { break; }
+            thread::sleep(time::Duration::from_millis(100));
+          }
         }
     }
 }
