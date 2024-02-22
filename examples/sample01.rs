@@ -49,7 +49,9 @@ fn main() {
   // tempo|120      |300
 
   player.play(
-    1, Rhythm::new(2, 4),
+    1, 
+    None,
+    Rhythm::new(2, 4),
     Key::SHARP_1,
     &note_repo,
     &bar_repo,

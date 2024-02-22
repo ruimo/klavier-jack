@@ -6,6 +6,7 @@ use crate::player::{PlayError, AccumTick};
 use error_stack::{Result, Context};
 use tracing::error;
 use crate::player;
+use klavier_core::play_start_tick::PlayStartTick;
 
 #[cfg(not(test))]
 use player::JackClientProxy;
@@ -96,7 +97,7 @@ impl Tracker {
 
   pub fn play(
     &mut self,
-    seq: usize, top_rhythm: Rhythm, top_key: Key,
+    seq: usize, play_start_loc: Option<PlayStartTick>, top_rhythm: Rhythm, top_key: Key,
     note_repo: &BagStore<u32, Rc<Note>, ModelChangeMetadata>,
     bar_repo: &Store<u32, Bar, ModelChangeMetadata>,
     tempo_repo: &Store<u32, Tempo, ModelChangeMetadata>,
@@ -110,7 +111,7 @@ impl Tracker {
         }
 
         let p = jack.play(
-          self.seq,
+          self.seq, play_start_loc,
           top_rhythm, top_key, note_repo, bar_repo, tempo_repo, dumper_repo, soft_repo
         ).map_err(|e| {
           let top = TrackerError::PlayerErr(e.current_context().clone());
@@ -158,6 +159,7 @@ mod tests {
   use crate::tracker::{Status, TrackerError};
   use super::Tracker;
   use crate::player::TestJackClientProxy;
+  use klavier_core::play_start_tick::PlayStartTick;
 
   #[test]
   fn new() {
@@ -210,9 +212,10 @@ mod tests {
     );
     let (mut tracker, status) = Tracker::run("my name", Some(factory)).unwrap();
     assert_eq!(status, jack::ClientStatus::INIT_FAILURE);
+    let play_start_loc = None;
 
     let result = tracker.play(
-      1, Rhythm::new(2, 4),
+      1, play_start_loc, Rhythm::new(2, 4),
       Key::SHARP_1,
       &BagStore::new(false),
       &Store::new(false),

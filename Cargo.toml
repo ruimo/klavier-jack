@@ -12,9 +12,9 @@ repository = "https://github.com/ruimo/klavier-jack"
 
 [dependencies]
 #klavier-helper = { path = "../klavier-helper" }
-klavier-helper = "0.1.3-beta.7"
-#klavier-core = { path = "../klavier-core" }
-klavier-core = "0.1.1-beta.11"
+klavier-helper = "0.1.3-beta.8"
+#klavier-core = "0.1.1-beta.11"
+klavier-core = { path = "../klavier-core" }
 jack = "^0"
 error-stack = "0.4.1"
 once_cell = "1"
