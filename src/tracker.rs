@@ -2,11 +2,12 @@ use std::{fmt::Display, sync::{Arc, Mutex}, thread, rc::Rc};
 
 use klavier_core::{bar::Bar, rhythm::Rhythm, key::Key, note::Note, project::ModelChangeMetadata, tempo::Tempo, ctrl_chg::CtrlChg, global_repeat::RenderRegionWarning};
 use klavier_helper::{bag_store::BagStore, store::Store};
-use crate::player::{PlayError, AccumTick};
+use crate::player::PlayError;
 use error_stack::{Result, Context};
 use tracing::error;
 use crate::player;
 use klavier_core::play_start_tick::PlayStartTick;
+use klavier_core::repeat::AccumTick;
 
 #[cfg(not(test))]
 use player::JackClientProxy;
@@ -97,7 +98,7 @@ impl Tracker {
 
   pub fn play(
     &mut self,
-    seq: usize, play_start_loc: Option<PlayStartTick>, top_rhythm: Rhythm, top_key: Key,
+    seq: usize, play_start_tick: Option<PlayStartTick>, top_rhythm: Rhythm, top_key: Key,
     note_repo: &BagStore<u32, Rc<Note>, ModelChangeMetadata>,
     bar_repo: &Store<u32, Bar, ModelChangeMetadata>,
     tempo_repo: &Store<u32, Tempo, ModelChangeMetadata>,
@@ -111,7 +112,7 @@ impl Tracker {
         }
 
         let p = jack.play(
-          self.seq, play_start_loc,
+          self.seq, play_start_tick,
           top_rhythm, top_key, note_repo, bar_repo, tempo_repo, dumper_repo, soft_repo
         ).map_err(|e| {
           let top = TrackerError::PlayerErr(e.current_context().clone());

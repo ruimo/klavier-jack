@@ -9,8 +9,8 @@ use std::{
 };
 
 use error_stack::{Context, Result};
-use jack::{Client, ClientStatus, Control, MidiOut, MidiWriter, ProcessScope, RawMidi};
-use klavier_core::bar::RepeatSet;
+use jack::{Client, ClientStatus, Control, MidiOut, ProcessScope, RawMidi};
+use klavier_core::{bar::RepeatSet, play_start_tick::ToAccumTickError};
 use klavier_core::channel::Channel;
 use klavier_core::play_start_tick::PlayStartTick;
 use klavier_core::{
@@ -23,7 +23,7 @@ use klavier_core::{
     octave::Octave,
     pitch::Pitch,
     project::{tempo_at, ModelChangeMetadata},
-    repeat::{render_region, Chunk, RenderRegionError},
+    repeat::{render_region, Chunk, RenderRegionError, AccumTick},
     repeat_set,
     rhythm::Rhythm,
     sharp_flat::SharpFlat,
@@ -34,10 +34,7 @@ use klavier_core::{
 use klavier_helper::{bag_store::BagStore, sliding, store::{self, Store}};
 
 #[cfg(not(test))]
-use jack::{AsyncClient, ClosureProcessHandler};
-
-// Accumulated tick after rendering repeats.
-pub type AccumTick = u32;
+use jack::{AsyncClient, ClosureProcessHandler, MidiWriter};
 
 pub struct Player {
     pub sampling_rate: usize,
@@ -224,20 +221,10 @@ struct MidiEvents {
 
 impl MidiEvents {
     fn new(chunks: &[Chunk]) -> Self {
-        let mut offset: u32 = 0;
-        let mut buf: Store<AccumTick, Chunk, ()> = Store::new(false);
-
-        for c in chunks {
-            buf.add(offset, c.clone(), ());
-            if c.end_tick() != u32::MAX {
-                offset += c.len();
-            }
-        }
-
         Self {
             events: BTreeMap::new(),
             tempo_table: Store::new(false),
-            chunks: buf,
+            chunks: Chunk::by_accum_tick(chunks),
         }
     }
 
@@ -256,7 +243,7 @@ impl MidiEvents {
         self.tempo_table.add(tick, tempo, ());
     }
 
-    fn cycles_by_tick(
+    fn cycles_by_accum_tick(
         &self,
         sampling_rate: usize,
         ticks_per_quarter: u32,
@@ -278,7 +265,7 @@ impl MidiEvents {
         buf
     }
 
-    fn accum_tick_to_cycle(finder: &store::Finder<'_, u32, (TempoValue, u64), ()>, tick: AccumTick, sampling_rate: usize, ticks_per_quarter: u32) -> u64 {
+    fn accum_tick_to_cycle(finder: &mut store::Finder<'_, u32, (TempoValue, u64), ()>, tick: AccumTick, sampling_rate: usize, ticks_per_quarter: u32) -> u64 {
         match finder.just_before(tick) {
             Some((t, (tempo, cycles))) => 
                 *cycles + Self::tick_to_cycle(tick - *t, sampling_rate, tempo.as_u16(), ticks_per_quarter),
@@ -299,7 +286,7 @@ impl MidiEvents {
         let mut table_for_tracking = Store::new(false);
 
         for (tick, events) in self.events.iter() {
-            let c = Self::accum_tick_to_cycle(&cycles_by_tick, *tick, sampling_rate, ticks_per_quarter);
+            let c = Self::accum_tick_to_cycle(&mut cycles_by_tick, *tick, sampling_rate, ticks_per_quarter);
             for e in events.iter() {
                 let mut midi = vec![];
                 e.render_to(&mut midi);
@@ -315,7 +302,7 @@ impl MidiEvents {
         }
 
         for (tick, tempo) in self.tempo_table.iter() {
-            let c = Self::accum_tick_to_cycle(&cycles_by_tick, *tick, sampling_rate, ticks_per_quarter);
+            let c = Self::accum_tick_to_cycle(&mut cycles_by_tick, *tick, sampling_rate, ticks_per_quarter);
             table_for_tracking.add(c, (*tick, tempo.clone()), ());
         }
 
@@ -326,9 +313,9 @@ impl MidiEvents {
         }
     }
 
-    fn play_start_cycle(&self, play_start_tick: PlayStartTick) -> u64 {
-
-    }
+//    fn play_start_cycle(&self, play_start_tick: PlayStartTick) -> u64 {
+//
+//    }
 }
 
 #[derive(Clone)]
@@ -769,7 +756,7 @@ impl Player {
         let mut events = MidiEvents::new(&chunks);
         for chunk in chunks.iter() {
             events.add_tempo(
-                chunk.start_tick() + offset,
+                offset,
                 tempo_at(chunk.start_tick(), tempo_repo),
             );
 
@@ -802,7 +789,7 @@ impl Player {
                 .chain(bottom_bars.iter())
                 .peekable();
 
-            let key = key_finder
+            let mut key = *key_finder
                 .just_before(chunk.start_tick())
                 .map(|(_tick, key)| key)
                 .unwrap_or(&top_key);
@@ -815,11 +802,9 @@ impl Player {
             let mut softs = softs.iter().peekable();
 
             for (bar_from, bar_to) in sliding(&mut bar_itr) {
-                let key = if let Some(key) = bar_from.1.key {
-                    key
-                } else {
-                    *key
-                };
+                if let Some(new_key) = bar_from.1.key {
+                    key = new_key;
+                }
                 let mut midi_reporter = MidiReporter::new(key);
 
                 while let Some((_tick, note)) = notes.next_if(|(_tick, note)| {
@@ -849,7 +834,7 @@ impl Player {
 
             let (_, tempos) = tempo_repo.range(chunk.start_tick()..chunk.end_tick());
             for (tick, tempo) in tempos.iter() {
-                events.add_tempo(tick + offset + chunk.start_tick(), tempo.value);
+                events.add_tempo((tick - chunk.start_tick()) + offset, tempo.value);
             }
 
             if chunk.end_tick() != u32::MAX {
@@ -884,11 +869,23 @@ impl Player {
         )
         .map_err(|e| PlayError::RenderError(e.current_context().clone()))?;
 
-        let cycles_by_tick = events.cycles_by_tick(self.sampling_rate, Duration::TICK_RESOLUTION as u32);
+        let cycles_by_tick = events.cycles_by_accum_tick(self.sampling_rate, Duration::TICK_RESOLUTION as u32);
+        let start_accum_tick = match play_start_loc {
+            None => 0,
+            Some(loc) => {
+                match loc.to_accum_tick(&events.chunks) {
+                    Ok(tick) => tick,
+                    Err(err) => Err(PlayError::PlayStartTickError(err))?,
+                }
+            }
+        };
+        let start_cycle = MidiEvents::accum_tick_to_cycle(
+            &mut cycles_by_tick.finder(), start_accum_tick, self.sampling_rate, Duration::TICK_RESOLUTION as u32
+        );
         let play_data = events.to_play_data(cycles_by_tick, self.sampling_rate, Duration::TICK_RESOLUTION as u32);
 
         self.cmd_channel
-            .send(Cmd::Play { seq, play_data })
+            .send(Cmd::Play { seq, play_data, start_cycle })
             .map_err(|_e| PlayError::SendError { seq })?;
         Ok(warnings)
     }
@@ -935,6 +932,7 @@ impl Drop for Player {
 pub enum PlayError {
     RenderError(RenderRegionError),
     SendError { seq: usize },
+    PlayStartTickError(ToAccumTickError),
 }
 
 impl Display for PlayError {
@@ -1015,13 +1013,12 @@ impl Context for PlayError {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Cmd, JCProxy, PlayState, Player, Resp};
+    use super::{Cmd, PlayState, Player, Resp};
     use crate::player::TestJackClientProxy;
     use crate::player::{CmdError, CmdInfo, MidiSrc};
     use jack::ClientStatus;
     use klavier_core::bar::RepeatSet;
     use klavier_core::duration::Duration;
-    use klavier_core::play_start_tick::PlayStartTick;
     use klavier_core::{
         bar::{Bar, Repeat},
         key::Key,
@@ -1230,7 +1227,7 @@ mod tests {
             ]
         );
 
-        let cycles_by_tick = events.cycles_by_tick(48000, Duration::TICK_RESOLUTION as u32);
+        let cycles_by_tick = events.cycles_by_accum_tick(48000, Duration::TICK_RESOLUTION as u32);
         let play_data = events.to_play_data(cycles_by_tick, 48000, 240);
         let midi_data = &play_data.midi_data;
         assert_eq!(midi_data.len(), 2);
@@ -1521,6 +1518,179 @@ mod tests {
         );
     }
 
+    //      0    100  200  300  400 480 560   720        960
+    //      V    V    V    V    V  :|   V     V          |
+    //      <-- note0 --><--note1--><--note2--><--note3-->
+    // tempo|120                |30     120
+    #[test]
+    fn repeat_and_tempo() {
+        let mut note_repo = BagStore::new(false);
+        let mut bar_repo: Store<u32, Bar, ModelChangeMetadata> = Store::new(false);
+        let mut tempo_repo = Store::new(false);
+
+        let note0 = Rc::new(Note {
+            base_start_tick: 0, pitch: Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Null), ..Default::default()
+        });
+        note_repo.add(
+            note0.start_tick(), note0.clone(), ModelChangeMetadata::new(),
+        );
+
+        let note1 = Rc::new(Note {
+            base_start_tick: 240, pitch: Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Null), ..Default::default()
+        });
+        note_repo.add(
+            note1.start_tick(), note1.clone(), ModelChangeMetadata::new(),
+        );
+
+        let note2 = Rc::new(Note {
+            base_start_tick: 480, pitch: Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Null), ..Default::default()
+        });
+        note_repo.add(
+            note2.start_tick(), note2.clone(), ModelChangeMetadata::new(),
+        );
+
+        let note3 = Rc::new(Note {
+            base_start_tick: 720, pitch: Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Null), ..Default::default()
+        });
+        note_repo.add(
+            note3.start_tick(), note3.clone(), ModelChangeMetadata::new(),
+        );
+
+        tempo_repo.add(400, Tempo::new(400, 30), ModelChangeMetadata::new());
+        tempo_repo.add(560, Tempo::new(560, 120), ModelChangeMetadata::new());
+
+        bar_repo.add(
+            480,
+            Bar::new(480, None, None, repeat_set!(Repeat::End)),
+            ModelChangeMetadata::new(),
+        );
+
+        bar_repo.add(
+            960,
+            Bar::new(960, None, None, repeat_set!()),
+            ModelChangeMetadata::new(),
+        );
+
+        let (events, _warnings) = Player::create_midi_events(
+            None,
+            Rhythm::new(2, 4),
+            Key::SHARP_1,
+            &note_repo,
+            &bar_repo,
+            &tempo_repo,
+            &Store::new(false),
+            &Store::new(false),
+        ).unwrap();
+
+        let cycles_by_tick = events.cycles_by_accum_tick(48000, Duration::TICK_RESOLUTION as u32);
+        let play_data = events.to_play_data(cycles_by_tick, 48000, 240);
+        let midi_data = &play_data.midi_data;
+
+        // tick: 400, cycle = 40000
+        // tick: 480, cycle = 40000 + 32000 = 72000
+        // tick: 720, cycle = 72000 + 240*48000*60/120/240 = 96000
+        // tick: 960, cycle = 96000 + (240-80)*48000*60/120/240 + 80*48000*60/30/240 = 144000
+        // tick: 1040, cycle = 144000 + 80*48000*60/30/240 = 176000
+        // tick: 1200, cycle = 176000 + (240-80)*48000*60/120/240 = 192000
+        // tick: 1440, cycle = 192000 + 240*48000*60/120/240 = 216000
+
+        let cycle = 0 * 48000 * 60 / 120 / 240;
+        assert_eq!(
+            midi_data[0],
+            (
+                cycle,
+                vec![vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), Velocity::default().as_u8()
+                ]]
+            )
+        );
+        assert_eq!(play_data.cycle_to_tick(cycle, 48000), 0);
+
+        let cycle = 240 * 48000 * 60 / 120 / 240;
+        assert_eq!(
+            midi_data[1],
+            (
+                cycle,
+                vec![vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), 0
+                ], vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), Velocity::default().as_u8()
+                ]]
+            )
+        );
+        assert_eq!(play_data.cycle_to_tick(cycle, 48000), 240);
+
+        let cycle = 400 * 48000 * 60 / 120 / 240
+             + 80 * 48000 * 60 / 30 / 240;
+        assert_eq!(
+            midi_data[2],
+            (
+                cycle,
+                vec![vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), 0
+                ], vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), Velocity::default().as_u8()
+                ]]
+            )
+        );
+        assert_eq!(play_data.cycle_to_tick(cycle, 48000), 480);
+
+        let cycle = cycle
+             + 240 * 48000 * 60 / 120 / 240;
+        assert_eq!(
+            midi_data[3],
+            (
+                cycle,
+                vec![vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), 0
+                ], vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), Velocity::default().as_u8()
+                ]]
+            )
+        );
+        assert_eq!(play_data.cycle_to_tick(cycle, 48000), 480 + 240);
+
+        let cycle = cycle + (240-80)*48000*60/120/240 + 80*48000*60/30/240;
+        assert_eq!(
+            midi_data[4],
+            (
+                cycle,
+                vec![vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), 0
+                ], vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), Velocity::default().as_u8()
+                ]]
+            )
+        );
+        assert_eq!(play_data.cycle_to_tick(cycle, 48000), 960);
+
+        let cycle = cycle + 80*48000*60/30/240 + (240-80)*48000*60/120/240;
+        assert_eq!(
+            midi_data[5],
+            (
+                cycle,
+                vec![vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), 0
+                ], vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), Velocity::default().as_u8()
+                ]]
+            )
+        );
+        assert_eq!(play_data.cycle_to_tick(cycle, 48000), 1200);
+
+        let cycle = cycle + 240*48000*60/120/240;
+        assert_eq!(
+            midi_data[6],
+            (
+                cycle,
+                vec![vec![
+                    0x90, Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Sharp).value(), 0
+                ]]
+            )
+        );
+        assert_eq!(play_data.cycle_to_tick(cycle, 48000), 1440);
+    }
+
     #[test]
     fn with_dc() {
         let mut note_repo = BagStore::new(false);
@@ -1578,8 +1748,8 @@ mod tests {
         tempo_repo.add(200, Tempo::new(200, 300), ModelChangeMetadata::new());
 
         //      0    100  200  300 340 400   480 500  600      740   840 960
-        //      |    |    |    |   |   |     :|  |    |        |     |   |D.C.
-        //            <-- note0 -->               <-- note1 -->      |
+        //      V    V    V    V   V   V     :|  V    V        V     V   |D.C.
+        //            <-- note0 -->               <-- note1 -->      V
         //                                             <-- note 2 -->
         // tempo|120      |300
 
@@ -1686,17 +1856,18 @@ mod tests {
             }]
         );
 
-        assert_eq!(events.tempo_table.len(), 6);
+        assert_eq!(events.tempo_table.len(), 7);
         let mut z = events.tempo_table.iter();
         assert_eq!(z.next(), Some(&(0, TempoValue::new(120))));
         assert_eq!(z.next(), Some(&(200, TempoValue::new(300))));
         assert_eq!(z.next(), Some(&(480, TempoValue::new(120))));
         assert_eq!(z.next(), Some(&(680, TempoValue::new(300))));
+        assert_eq!(z.next(), Some(&(480 * 2, TempoValue::new(300))));
         assert_eq!(z.next(), Some(&(480 * 3, TempoValue::new(120))));
         assert_eq!(z.next(), Some(&(480 * 3 + 200, TempoValue::new(300))));
         assert_eq!(z.next(), None);
 
-        let cycles_by_tick = events.cycles_by_tick(48000, Duration::TICK_RESOLUTION as u32);
+        let cycles_by_tick = events.cycles_by_accum_tick(48000, Duration::TICK_RESOLUTION as u32);
         let play_data = events.to_play_data(cycles_by_tick, 48000, 240);
         let midi_data = &play_data.midi_data;
         assert_eq!(midi_data.len(), 10);
@@ -1969,7 +2140,7 @@ mod tests {
             }]
         );
 
-        let cycles_by_tick = events.cycles_by_tick(48000, Duration::TICK_RESOLUTION as u32);
+        let cycles_by_tick = events.cycles_by_accum_tick(48000, Duration::TICK_RESOLUTION as u32);
         let play_data = events.to_play_data(cycles_by_tick, 48000, 240);
         let midi_data = &play_data.midi_data;
 
@@ -2062,7 +2233,7 @@ mod tests {
         )
         .unwrap();
 
-        let cycles_by_tick = events.cycles_by_tick(48000, Duration::TICK_RESOLUTION as u32);
+        let cycles_by_tick = events.cycles_by_accum_tick(48000, Duration::TICK_RESOLUTION as u32);
         let play_data0 = events.to_play_data(cycles_by_tick, 48000, 240);
 
         let factory = Box::new(|app_name: &str, _options| {
@@ -2132,7 +2303,7 @@ mod tests {
         )
         .unwrap();
 
-        let cycles_by_tick = events.cycles_by_tick(48000, Duration::TICK_RESOLUTION as u32);
+        let cycles_by_tick = events.cycles_by_accum_tick(48000, Duration::TICK_RESOLUTION as u32);
         let play_data0 = events.to_play_data(cycles_by_tick, 48000, 240);
         let factory = Box::new(|app_name: &str, _options| {
             Ok(TestJackClientProxy {
@@ -2367,6 +2538,54 @@ mod tests {
             events.events.get(&1220).unwrap(),
             &vec![MidiSrc::NoteOff {
                 pitch: note1.pitch,
+                channel: Default::default()
+            }]
+        );
+    }
+
+    #[test]
+    fn key_changes() {
+        let mut note_repo = BagStore::new(false);
+        let note0 = Rc::new(Note {
+            base_start_tick: 480,
+            pitch: Pitch::new(Solfa::F, Octave::Oct4, SharpFlat::Null),
+            ..Default::default()
+        });
+        note_repo.add(
+            note0.start_tick(),
+            note0.clone(),
+            ModelChangeMetadata::new(),
+        );
+
+        let mut bar_repo: Store<u32, Bar, ModelChangeMetadata> = Store::new(false);
+        bar_repo.add(
+            240,
+            Bar::new(240, None, Some(Key::NONE), repeat_set!()),
+            ModelChangeMetadata::new(),
+        );
+        bar_repo.add(
+            480,
+            Bar::new(480, None, None, repeat_set!()),
+            ModelChangeMetadata::new(),
+        );
+
+        let (events, _warnings) = Player::create_midi_events(
+            None,
+            Rhythm::new(4, 4),
+            Key::SHARP_1,
+            &note_repo,
+            &bar_repo,
+            &Store::new(false),
+            &Store::new(false),
+            &Store::new(false),
+        ).unwrap();
+
+        assert_eq!(events.events.len(), 2);
+        assert_eq!(
+            events.events.get(&480).unwrap(),
+            &vec![MidiSrc::NoteOn {
+                pitch: note0.pitch,
+                velocity: note0.velocity(),
                 channel: Default::default()
             }]
         );
