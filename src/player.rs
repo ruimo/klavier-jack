@@ -157,7 +157,7 @@ impl MidiReporter {
 
             if !note.tie {
                 ret.push((
-                    note.start_tick() + note.duration.tick_length(),
+                    note.start_tick() + note.tick_len(),
                     MidiSrc::NoteOff {
                         pitch,
                         channel: note.channel,
