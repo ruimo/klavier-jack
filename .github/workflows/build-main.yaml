@@ -15,7 +15,9 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - name: Prepare
-      run: sudo apt install qjackctl pulseaudio-module-jack libjack-jackd2-dev
+      run: |
+      sudo apt-get update -y
+      sudo apt install qjackctl pulseaudio-module-jack libjack-jackd2-dev
     - name: Build
       run: cargo build --verbose
     - name: Run tests
