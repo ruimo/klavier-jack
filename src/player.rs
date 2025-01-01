@@ -360,6 +360,7 @@ pub enum PlayState {
         current_loc: u64,
         play_data: PlayData,
     },
+    Stopping,
 }
 
 #[cfg(not(test))]
@@ -545,7 +546,16 @@ impl Player {
                                 error: CmdError::AlreadyPlaying,
                             },
                         );
-                    }
+                    },
+                    PlayState::Stopping => {
+                        Self::resp(
+                            &resp_sender,
+                            Resp::Err {
+                                seq: Some(seq),
+                                error: CmdError::AlreadyPlaying,
+                            },
+                        );
+                    },
                 },
                 Cmd::Stop { seq } => match pstate {
                     PlayState::Init => {
@@ -556,7 +566,7 @@ impl Player {
                         current_loc: _,
                         play_data: _,
                     } => {
-                        *pstate = PlayState::Init;
+                        *pstate = PlayState::Stopping;
                         Self::resp(
                             &resp_sender,
                             Resp::Info {
@@ -564,7 +574,10 @@ impl Player {
                                 info: CmdInfo::PlayingEnded,
                             },
                         );
-                    }
+                    },
+                    PlayState::Stopping => {
+                        Self::resp(&resp_sender, Resp::Ok { seq });
+                    },
                 },
             },
             Err(err) => {
@@ -644,7 +657,26 @@ impl Player {
                     );
                     *current_loc = new_loc;
                 }
-            }
+            },
+            PlayState::Stopping => {
+                let mut bytes: Vec<u8> = Vec::with_capacity(3 * 16);
+                for ch in 0..16 {
+                    bytes.push(0xB0 + ch);
+                    bytes.push(120);
+                    bytes.push(0);
+                }
+
+                if let Err(e) = midi_writer.write(&jack::RawMidi { time: 0, bytes: &bytes }) {
+                    Self::resp(
+                        &resp_sender,
+                        Resp::Err {
+                            seq: None,
+                            error: CmdError::MidiWriteError(e.to_string()),
+                        },
+                    )
+                }
+                *pstate = PlayState::Init;
+            },
         }
     }
 
@@ -2349,7 +2381,8 @@ mod tests {
                 let midi_data0: Vec<&(u64, Vec<Vec<u8>>)> = play_data0.midi_data.iter().collect();
                 let midi_data1: Vec<&(u64, Vec<Vec<u8>>)> = play_data.midi_data.iter().collect();
                 assert_eq!(midi_data0, midi_data1);
-            }
+            },
+            PlayState::Stopping => panic!("Should playing.")
         }
         let resp = resp_receiver.recv().unwrap();
         assert_eq!(resp, Resp::Ok { seq: 1 });
@@ -2384,7 +2417,8 @@ mod tests {
                 let midi_data0: Vec<&(u64, Vec<Vec<u8>>)> = play_data0.midi_data.iter().collect();
                 let midi_data1: Vec<&(u64, Vec<Vec<u8>>)> = play_data.midi_data.iter().collect();
                 assert_eq!(midi_data0, midi_data1);
-            }
+            },
+            PlayState::Stopping => panic!("Should playing.")
         }
         let resp = resp_receiver.recv().unwrap();
         assert_eq!(
@@ -2407,6 +2441,7 @@ mod tests {
                 current_loc: _,
                 play_data: _,
             } => panic!("Should init"),
+            PlayState::Stopping => {}
         }
         let resp = resp_receiver.recv().unwrap();
         assert_eq!(
@@ -2429,6 +2464,7 @@ mod tests {
                 current_loc: _,
                 play_data: _,
             } => panic!("Should init"),
+            PlayState::Stopping => {}
         }
         let resp = resp_receiver.recv().unwrap();
         assert_eq!(resp, Resp::Ok { seq: 4 });

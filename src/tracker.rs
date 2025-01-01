@@ -22,7 +22,6 @@ use player::Player;
 pub enum Status {
   Stopped,
   StartingPlay { seq: usize },
-  StoppingPlay { seq: usize },
   Playing { seq: usize, tick: u32, accum_tick: AccumTick },
   Disconnected,
 }
@@ -107,10 +106,6 @@ impl Tracker {
   ) -> Result <Vec<RenderRegionWarning>, TrackerError> {
     match &mut self.player {
       Some(jack) => {
-        if let Status::StoppingPlay { seq } = *self.status.lock().unwrap() {
-          Err(TrackerError::PlayerStopping { seq })?;
-        }
-
         let p = jack.play(
           self.seq, play_start_tick,
           top_rhythm, top_key, note_repo, bar_repo, tempo_repo, dumper_repo, soft_repo
@@ -136,7 +131,7 @@ impl Tracker {
             let top = TrackerError::PlayerErr(e.current_context().clone());
             e.change_context(top)
           })?;
-          *pstatus = Status::StoppingPlay { seq };
+          *pstatus = Status::Stopped;
         } else {
           Err(TrackerError::NotPlaying(*pstatus))?
         }
