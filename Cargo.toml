@@ -1,6 +1,6 @@
 [package]
 name = "klavier-jack"
-version = "0.1.5-beta.1"
+version = "0.1.5"
 edition = "2021"
 description = "Jack library of klavier."
 license = "Apache-2.0"
