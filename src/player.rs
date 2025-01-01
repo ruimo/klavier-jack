@@ -851,7 +851,7 @@ impl Player {
                     bar_from.0 <= dumper.start_tick && dumper.start_tick < bar_to.0
                 }) {
                     for (tick, midi_src) in midi_reporter.on_dumper(*dumper).iter() {
-                        events.add_midi_event(tick + offset + chunk.start_tick(), *midi_src);
+                        events.add_midi_event(tick + offset - chunk.start_tick(), *midi_src);
                     }
                 }
 
@@ -859,7 +859,7 @@ impl Player {
                     bar_from.0 <= dumper.start_tick && dumper.start_tick < bar_to.0
                 }) {
                     for (tick, midi_src) in midi_reporter.on_soft(*soft).iter() {
-                        events.add_midi_event(tick + offset + chunk.start_tick(), *midi_src);
+                        events.add_midi_event(tick + offset - chunk.start_tick(), *midi_src);
                     }
                 }
             }
