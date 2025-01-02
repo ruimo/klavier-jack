@@ -10,7 +10,7 @@ use std::{
 
 use error_stack::{Context, Result};
 use jack::{Client, ClientStatus, Control, MidiOut, ProcessScope, RawMidi};
-use klavier_core::{bar::RepeatSet, play_start_tick::ToAccumTickError};
+use klavier_core::{bar::RepeatSet, have_start_tick::HaveStartTick, play_start_tick::ToAccumTickError};
 use klavier_core::channel::Channel;
 use klavier_core::play_start_tick::PlayStartTick;
 use klavier_core::{
@@ -785,6 +785,7 @@ impl Player {
         let mut offset: u32 = 0;
 
         let chunks = region.to_chunks();
+println!("chunks: {:?}", chunks);
         let mut events = MidiEvents::new(&chunks);
         for chunk in chunks.iter() {
             events.add_tempo(
@@ -793,7 +794,7 @@ impl Player {
             );
 
             let (_size, bars) = bar_repo.range(chunk.start_tick()..=chunk.end_tick());
-            let top_bars = match bars.get(0) {
+            let top_bars: &Vec<(u32, Bar)> = match bars.get(0) {
                 Some((_idx, top_bar)) => {
                     if top_bar.start_tick != 0 {
                         &imaginary_top_bar
@@ -804,7 +805,7 @@ impl Player {
                 None => &imaginary_top_bar,
             };
 
-            let bottom_bars = match bars.last() {
+            let bottom_bars: &Vec<(u32, Bar)> = match bars.last() {
                 Some((_idx, last_bar)) => {
                     if last_bar.start_tick < chunk.end_tick() {
                         &imaginary_bottom_bar
@@ -821,10 +822,6 @@ impl Player {
                 .chain(bottom_bars.iter())
                 .peekable();
 
-            let mut key = *key_finder
-                .just_before(chunk.start_tick())
-                .map(|(_tick, key)| key)
-                .unwrap_or(&top_key);
             let mut notes = notes_by_base_start_tick
                 .range(chunk.start_tick()..chunk.end_tick())
                 .peekable();
@@ -834,6 +831,11 @@ impl Player {
             let mut softs = softs.iter().peekable();
 
             for (bar_from, bar_to) in sliding(&mut bar_itr) {
+                let mut key = *key_finder
+                .just_before(bar_from.1.start_tick())
+                .map(|(_tick, key)| key)
+                .unwrap_or(&top_key);
+
                 if let Some(new_key) = bar_from.1.key {
                     key = new_key;
                 }
