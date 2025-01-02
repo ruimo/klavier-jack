@@ -785,7 +785,6 @@ impl Player {
         let mut offset: u32 = 0;
 
         let chunks = region.to_chunks();
-println!("chunks: {:?}", chunks);
         let mut events = MidiEvents::new(&chunks);
         for chunk in chunks.iter() {
             events.add_tempo(
