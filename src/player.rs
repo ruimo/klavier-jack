@@ -661,11 +661,10 @@ impl Player {
             PlayState::Stopping => {
                 let mut bytes: Vec<u8> = Vec::with_capacity(3 * 16);
                 for ch in 0..16 {
-                    bytes.push(0xB0 + ch);
-                    bytes.push(120);
+                    bytes.push(0xB0 + ch); // Soft off
+                    bytes.push(67);
                     bytes.push(0);
                 }
-
                 if let Err(e) = midi_writer.write(&jack::RawMidi { time: 0, bytes: &bytes }) {
                     Self::resp(
                         &resp_sender,
@@ -675,6 +674,39 @@ impl Player {
                         },
                     )
                 }
+
+                let mut bytes: Vec<u8> = Vec::with_capacity(3 * 16);
+                for ch in 0..16 {
+                    bytes.push(0xB0 + ch); // All sound off
+                    bytes.push(120);
+                    bytes.push(0);
+                }
+                if let Err(e) = midi_writer.write(&jack::RawMidi { time: 0, bytes: &bytes }) {
+                    Self::resp(
+                        &resp_sender,
+                        Resp::Err {
+                            seq: None,
+                            error: CmdError::MidiWriteError(e.to_string()),
+                        },
+                    )
+                }
+
+                let mut bytes: Vec<u8> = Vec::with_capacity(3 * 16);
+                for ch in 0..16 {
+                    bytes.push(0xB0 + ch); // Dumper off
+                    bytes.push(64);
+                    bytes.push(0);
+                }
+                if let Err(e) = midi_writer.write(&jack::RawMidi { time: 0, bytes: &bytes }) {
+                    Self::resp(
+                        &resp_sender,
+                        Resp::Err {
+                            seq: None,
+                            error: CmdError::MidiWriteError(e.to_string()),
+                        },
+                    )
+                }
+
                 *pstate = PlayState::Init;
             },
         }
