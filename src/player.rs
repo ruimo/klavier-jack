@@ -37,6 +37,7 @@ use klavier_helper::{bag_store::BagStore, sliding, store::{self, Store}};
 use jack::{AsyncClient, ClosureProcessHandler, MidiWriter};
 
 pub struct Player {
+    // Frequency (ex. 48kHz => 48000)
     pub sampling_rate: usize,
     cmd_channel: SyncSender<Cmd>,
     resp_channel: Option<Receiver<Resp>>,
