@@ -15,7 +15,7 @@ fn main() {
       ..Default::default()
     }
   );
-  note_repo.add(note0.start_tick(), note0.clone(), ModelChangeMetadata::new());
+  note_repo.add(note0.start_tick(), note0.clone(), ModelChangeMetadata::default());
 
   let note1 = Rc::new(
     Note {
@@ -24,7 +24,7 @@ fn main() {
       ..Default::default()
     }
   );
-  note_repo.add(note1.start_tick(), note1.clone(), ModelChangeMetadata::new());
+  note_repo.add(note1.start_tick(), note1.clone(), ModelChangeMetadata::default());
 
   let note2 = Rc::new(
     Note {
@@ -33,14 +33,14 @@ fn main() {
       ..Default::default()
     }
   );
-  note_repo.add(note2.start_tick(), note2.clone(), ModelChangeMetadata::new());
+  note_repo.add(note2.start_tick(), note2.clone(), ModelChangeMetadata::default());
 
   let mut bar_repo: Store<u32, Bar, ModelChangeMetadata> = Store::new(false);
-  bar_repo.add(480, Bar::new(480, None, Some(Key::FLAT_1), repeat_set!(Repeat::End, Repeat::Fine)), ModelChangeMetadata::new());
-  bar_repo.add(960, Bar::new(960, None, None, repeat_set!(Repeat::Dc)), ModelChangeMetadata::new());
+  bar_repo.add(480, Bar::new(480, None, Some(Key::FLAT_1), repeat_set!(Repeat::End, Repeat::Fine)), ModelChangeMetadata::default());
+  bar_repo.add(960, Bar::new(960, None, None, repeat_set!(Repeat::Dc)), ModelChangeMetadata::default());
 
   let mut tempo_repo = Store::new(false);
-  tempo_repo.add(200, Tempo::new(200, 300), ModelChangeMetadata::new());
+  tempo_repo.add(200, Tempo::new(200, 300), ModelChangeMetadata::default());
 
   //      0    100  200  300 340 400   480 500  600      740   840 960
   //      |    |    |    |   |   |     :|  |    |        |     |   |D.C.
