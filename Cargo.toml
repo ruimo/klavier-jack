@@ -11,9 +11,9 @@ repository = "https://github.com/ruimo/klavier-jack"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-klavier-helper = "0.1.7"
+klavier-helper = "0.1.10"
 #klavier-helper = { path = "../klavier-helper" }
-klavier-core = "0.1.7"
+klavier-core = "0.1.10"
 #klavier-core = { path = "../klavier-core" }
 jack = "^0"
 error-stack = "^0"
