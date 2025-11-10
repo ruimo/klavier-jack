@@ -3,7 +3,7 @@ use std::{fmt::Display, sync::{Arc, Mutex}, thread, rc::Rc};
 use klavier_core::{bar::Bar, rhythm::Rhythm, key::Key, note::Note, project::ModelChangeMetadata, tempo::Tempo, ctrl_chg::CtrlChg, global_repeat::RenderRegionWarning};
 use klavier_helper::{bag_store::BagStore, store::Store};
 use crate::player::PlayError;
-use error_stack::{Result, Context};
+use error_stack::Report;
 use tracing::error;
 use crate::player;
 use klavier_core::play_start_tick::PlayStartTick;
@@ -46,12 +46,12 @@ impl Display for TrackerError {
     }
 }
 
-impl Context for TrackerError {}
+impl std::error::Error for TrackerError {}
 
 impl Tracker {
   pub fn run(
-    name: &str, mut client_factory: Option<Box<dyn FnOnce(&str, jack::ClientOptions) -> Result<JackClientProxy, jack::Error>>>
-  ) -> Result<(Self, jack::ClientStatus), jack::Error> {
+    name: &str, mut client_factory: Option<Box<dyn FnOnce(&str, jack::ClientOptions) -> core::result::Result<JackClientProxy, jack::Error>>>
+  ) -> core::result::Result<(Self, jack::ClientStatus), Report<jack::Error>> {
       let (mut player, client_status) = Player::open(name, client_factory.take())?;
       let receiver = player.take_resp().unwrap();
       let status = Arc::new(Mutex::new(Status::Stopped));
@@ -63,7 +63,7 @@ impl Tracker {
               player::Resp::Err { seq, error } => {
                 tracing::error!("Player command error seq: {:?}, error: {:?}", seq, error);
               }
-              player::Resp::Info { seq, info } => match info {
+              player::Resp::Info { seq: _, info } => match info {
                 player::CmdInfo::PlayingEnded => {
                   *moved_status.lock().unwrap() = Status::Stopped;
                 }
@@ -103,7 +103,7 @@ impl Tracker {
     tempo_repo: &Store<u32, Tempo, ModelChangeMetadata>,
     dumper_repo: &Store<u32, CtrlChg, ModelChangeMetadata>,
     soft_repo: &Store<u32, CtrlChg, ModelChangeMetadata>,
-  ) -> Result <Vec<RenderRegionWarning>, TrackerError> {
+  ) -> core::result::Result<Vec<RenderRegionWarning>, Report<TrackerError>> {
     match &mut self.player {
       Some(jack) => {
         let p = jack.play(
@@ -118,11 +118,11 @@ impl Tracker {
 
         Ok(p)
       }
-      None => Err(TrackerError::PlayerNotOpened)?,
+      None => Err(Report::new(TrackerError::PlayerNotOpened))?,
     }
   }
 
-  pub fn stop(&mut self, seq: usize) -> Result <(), TrackerError> {
+  pub fn stop(&mut self, _seq: usize) -> core::result::Result<(), Report<TrackerError>> {
     match &mut self.player {
       Some(jack)=> {
         let mut pstatus = self.status.lock().unwrap();
@@ -133,12 +133,12 @@ impl Tracker {
           })?;
           *pstatus = Status::Stopped;
         } else {
-          Err(TrackerError::NotPlaying(*pstatus))?
+          Err(Report::new(TrackerError::NotPlaying(*pstatus)))?
         }
 
         Ok(())
       }
-      None => Err(TrackerError::PlayerNotOpened)?,
+      None => Err(Report::new(TrackerError::PlayerNotOpened))?,
     }
   }
 
@@ -155,7 +155,6 @@ mod tests {
   use crate::tracker::{Status, TrackerError};
   use super::Tracker;
   use crate::player::TestJackClientProxy;
-  use klavier_core::play_start_tick::PlayStartTick;
 
   #[test]
   fn new() {

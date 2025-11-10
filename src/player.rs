@@ -7,7 +7,7 @@ use std::{
     time,
 };
 
-use error_stack::{Context, Result};
+use error_stack::Report;
 use jack::{Client, ClientStatus, Control, MidiOut, ProcessScope, RawMidi};
 use klavier_core::{midi_events::{MidiEvents, PlayData, create_midi_events}, play_start_tick::ToAccumTickError, tempo::TempoValue};
 use klavier_core::play_start_tick::PlayStartTick;
@@ -26,7 +26,7 @@ use klavier_core::{
 use klavier_helper::{bag_store::BagStore, store::{Store}};
 
 #[cfg(not(test))]
-use jack::{AsyncClient, ClosureProcessHandler, MidiWriter};
+use jack::MidiWriter;
 
 pub struct Player {
     // Frequency (ex. 48kHz => 48000)
@@ -92,14 +92,14 @@ pub struct TestMidiWriter<'a> {
 }
 
 impl<'a> TestMidiWriter<'a> {
-    pub fn write(&mut self, _message: &RawMidi) -> Result<(), jack::Error> {
+    pub fn write(&mut self, _message: &RawMidi) -> core::result::Result<(), jack::Error> {
         Ok(())
     }
 }
 
 #[cfg(not(test))]
 impl JackClientProxy {
-    pub fn new(app_name: &str, options: jack::ClientOptions) -> Result<Self, jack::Error> {
+    pub fn new(app_name: &str, options: jack::ClientOptions) -> core::result::Result<Self, jack::Error> {
         let (client, status) = jack::Client::new(app_name, options)?;
         Ok(Self {
             client: Some(client),
@@ -115,7 +115,7 @@ impl JackClientProxy {
         self.client.as_ref().map(|c| c.sample_rate()).unwrap()
     }
 
-    pub fn midi_out_port(&self) -> Result<Port<MidiOut>, jack::Error> {
+    pub fn midi_out_port(&self) -> core::result::Result<Port<MidiOut>, jack::Error> {
         Ok(self
             .client
             .as_ref()
@@ -126,13 +126,13 @@ impl JackClientProxy {
     pub fn closer<F>(
         &mut self,
         callback: F,
-    ) -> Result<Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>>, jack::Error>
+    ) -> core::result::Result<Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>>, jack::Error>
     where
         F: 'static + Send + FnMut(&Client, &ProcessScope) -> Control,
     {
-        let active_client: AsyncClient<(), ClosureProcessHandler<_>> = {
+        let active_client = {
             let client = self.client.take().unwrap();
-            client.activate_async((), jack::ClosureProcessHandler::new(callback))?
+            client.activate_async((), jack::contrib::ClosureProcessHandler::new(callback))?
         };
         let closer = move || active_client.deactivate().err();
         Ok(Some(Box::new(closer)))
@@ -163,7 +163,7 @@ pub struct TestJackClientProxy {
 use jack::Port;
 
 impl TestJackClientProxy {
-    pub fn new(_app_name: &str, _options: jack::ClientOptions) -> Result<Self, jack::Error> {
+    pub fn new(_app_name: &str, _options: jack::ClientOptions) -> core::result::Result<Self, jack::Error> {
         panic!("You need to pass client_factory to Player::open() for testing.");
     }
 
@@ -173,7 +173,7 @@ impl TestJackClientProxy {
         status: ClientStatus,
         buffer_size: u32,
         sampling_rate: usize,
-    ) -> Result<Self, jack::Error> {
+    ) -> core::result::Result<Self, jack::Error> {
         Ok(Self {
             status,
             app_name: app_name.to_owned(),
@@ -190,7 +190,7 @@ impl TestJackClientProxy {
         self.sampling_rate
     }
 
-    pub fn midi_out_port(&self) -> Result<TestPort<MidiOut>, jack::Error> {
+    pub fn midi_out_port(&self) -> core::result::Result<TestPort<MidiOut>, jack::Error> {
         Ok(TestPort {
             _phantom: PhantomData,
         })
@@ -199,7 +199,7 @@ impl TestJackClientProxy {
     pub fn closer<F>(
         &mut self,
         _callback: F,
-    ) -> Result<Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>>, jack::Error>
+    ) -> core::result::Result<Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>>, jack::Error>
     where
         F: 'static + Send + FnMut(&Client, &ProcessScope) -> Control,
     {
@@ -433,9 +433,9 @@ impl Player {
     pub fn open(
         app_name: &str,
         client_factory: Option<
-            Box<dyn FnOnce(&str, jack::ClientOptions) -> Result<JCProxy, jack::Error>>,
+            Box<dyn FnOnce(&str, jack::ClientOptions) -> core::result::Result<JCProxy, jack::Error>>,
         >,
-    ) -> Result<(Self, jack::ClientStatus), jack::Error> {
+    ) -> core::result::Result<(Self, jack::ClientStatus), Report<jack::Error>> {
         let mut proxy = match client_factory {
             Some(factory) => factory(app_name, jack::ClientOptions::empty())?,
             None => JCProxy::new(app_name, jack::ClientOptions::empty())?,
@@ -493,7 +493,7 @@ impl Player {
         tempo_repo: &Store<u32, Tempo, ModelChangeMetadata>,
         dumper_repo: &Store<u32, CtrlChg, ModelChangeMetadata>,
         soft_repo: &Store<u32, CtrlChg, ModelChangeMetadata>,
-    ) -> Result<Vec<RenderRegionWarning>, PlayError> {
+    ) -> core::result::Result<Vec<RenderRegionWarning>, Report<PlayError>> {
         let (events, warnings): (MidiEvents, Vec<RenderRegionWarning>) = create_midi_events(
             top_rhythm,
             top_key,
@@ -517,7 +517,7 @@ impl Player {
             }
         };
         let start_cycle: u64 = MidiEvents::accum_tick_to_cycle(
-            &mut cycles_by_tick.finder(), start_accum_tick, self.sampling_rate, Duration::TICK_RESOLUTION as u32
+            &cycles_by_tick, start_accum_tick, self.sampling_rate, Duration::TICK_RESOLUTION as u32
         );
         let play_data: PlayData = events.to_play_data(cycles_by_tick, self.sampling_rate, Duration::TICK_RESOLUTION as u32);
 
@@ -527,7 +527,7 @@ impl Player {
         Ok(warnings)
     }
 
-    pub fn stop(&mut self, seq: usize) -> Result<(), PlayError> {
+    pub fn stop(&mut self, seq: usize) -> core::result::Result<(), Report<PlayError>> {
         self.cmd_channel
             .send(Cmd::Stop { seq })
             .map_err(|_e| PlayError::SendError { seq })?;
@@ -535,7 +535,7 @@ impl Player {
     }
 
     /// Get response from the response receiver.
-    pub fn get_resp(&self) -> Result<Resp, RecvError> {
+    pub fn get_resp(&self) -> core::result::Result<Resp, RecvError> {
         match &self.resp_channel {
             Some(resp) => Ok(resp.recv()?),
             None => {
@@ -578,7 +578,7 @@ impl Display for PlayError {
     }
 }
 
-impl Context for PlayError {}
+impl std::error::Error for PlayError {}
 
 // pub struct TestPlayer {
 //   pub sampling_rate: usize,
@@ -705,7 +705,7 @@ mod tests {
                 sampling_rate: 48000,
             })
         });
-        let (mut player, status) = Player::open("my player", Some(factory)).unwrap();
+        let (mut player, _status) = Player::open("my player", Some(factory)).unwrap();
         let (cmd_sender, cmd_receiver) = sync_channel::<Cmd>(64);
 
         player.cmd_channel = cmd_sender;
@@ -727,7 +727,7 @@ mod tests {
         let cmd = cmd_receiver.recv().unwrap();
 
         match cmd {
-            Cmd::Play { seq, play_data, start_cycle } => {
+            Cmd::Play { seq, play_data, start_cycle: _ } => {
                 assert_eq!(seq, 1);
 
                 let midi_data0: Vec<&(u64, Vec<Vec<u8>>)> = play_data0.midi_data.iter().collect();
@@ -773,7 +773,7 @@ mod tests {
                 sampling_rate: 48000,
             })
         });
-        let (mut player, status) = Player::open("my player", Some(factory)).unwrap();
+        let (mut player, _status) = Player::open("my player", Some(factory)).unwrap();
         let (cmd_sender, cmd_receiver) = sync_channel::<Cmd>(64);
         let (resp_sender, resp_receiver) = sync_channel::<Resp>(64);
 
