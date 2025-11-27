@@ -30,7 +30,7 @@ use jack::MidiWriter;
 
 pub struct Player {
     // Frequency (ex. 48kHz => 48000)
-    pub sampling_rate: usize,
+    pub sampling_rate: u32,
     cmd_channel: SyncSender<Cmd>,
     resp_channel: Option<Receiver<Resp>>,
     closer: Option<Box<dyn Send + 'static + FnOnce() -> Option<jack::Error>>>,
@@ -111,8 +111,8 @@ impl JackClientProxy {
         self.client.as_ref().map(|c| c.buffer_size()).unwrap()
     }
 
-    pub fn sampling_rate(&self) -> usize {
-        self.client.as_ref().map(|c| c.sample_rate()).unwrap()
+    pub fn sampling_rate(&self) -> u32 {
+        self.client.as_ref().map(|c| c.sample_rate()).unwrap() as u32
     }
 
     pub fn midi_out_port(&self) -> core::result::Result<Port<MidiOut>, jack::Error> {
@@ -156,7 +156,7 @@ pub struct TestJackClientProxy {
 
     pub app_name: String,
     pub buffer_size: u32,
-    pub sampling_rate: usize,
+    pub sampling_rate: u32,
 }
 
 #[cfg(not(test))]
@@ -172,7 +172,7 @@ impl TestJackClientProxy {
         _options: jack::ClientOptions,
         status: ClientStatus,
         buffer_size: u32,
-        sampling_rate: usize,
+        sampling_rate: u32,
     ) -> core::result::Result<Self, jack::Error> {
         Ok(Self {
             status,
@@ -186,7 +186,7 @@ impl TestJackClientProxy {
         self.buffer_size
     }
 
-    pub fn sampling_rate(&self) -> usize {
+    pub fn sampling_rate(&self) -> u32 {
         self.sampling_rate
     }
 
@@ -313,7 +313,7 @@ impl Player {
         midi_writer: &mut MW<'a>,
         resp_sender: &SyncSender<Resp>,
         buffer_size: u32,
-        sampling_rate: usize,
+        sampling_rate: u32,
     ) {
         match pstate {
             PlayState::Init => {}
@@ -360,7 +360,7 @@ impl Player {
                     );
                     *pstate = PlayState::Init;
                 } else {
-                    let accum_tick = play_data.cycle_to_tick(*current_loc, sampling_rate as u32);
+                    let accum_tick = play_data.cycle_to_tick(*current_loc, sampling_rate);
                     let tick = play_data.accum_tick_to_tick(accum_tick);
                     Self::resp(
                         &resp_sender,
@@ -444,7 +444,7 @@ impl Player {
         let (resp_sender, resp_receiver) = sync_channel::<Resp>(64);
 
         let buffer_size: u32 = proxy.buffer_size();
-        let sampling_rate = proxy.sampling_rate();
+        let sampling_rate: u32 = proxy.sampling_rate();
         let mut state = PlayState::Init;
         let proxy_status = proxy.status;
 
